@@ -1,5 +1,6 @@
 import configparser
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -568,3 +569,130 @@ def test_a_containers_workdir_comes_off_the_image_not_a_running_process(monkeypa
 
     assert probes.instance_workdir(_DOCKER_INSTANCE, Host()) == Path("/opt/odoo")
     assert calls == [["docker", "inspect", "-f", "{{.Config.WorkingDir}}", "acme-odoo-1"]]
+
+
+def _fake_psql(tmp_path, monkeypatch, cases: dict[str, str]):
+    """A stub `psql` on PATH answering per database name, and a `Host.run`
+    that really executes the shell loop -- so the quoting of the multi-line
+    SQL argument is checked rather than assumed. Returns the recorded argv
+    list, to assert on the round trip count."""
+    body = "".join(f"  {db}) {answer} ;;\n" for db, answer in cases.items())
+    psql = tmp_path / "psql"
+    # the db name is the last argument (`-d <db>`)
+    psql.write_text('#!/bin/sh\ndb=$(eval echo \\$$#)\ncase "$db" in\n' + body + "esac\n")
+    psql.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+
+    calls: list[list[str]] = []
+
+    def run(_self, argv, input_text=None):
+        calls.append(argv)
+        return subprocess.run(argv, capture_output=True, text=True)  # noqa: S603 -- our own argv, through a stub psql
+
+    monkeypatch.setattr(Host, "run", run)
+    return calls
+
+
+def _signals(**overrides) -> str:
+    """One database's JSON row, as the real query would answer it."""
+    row = {"flag": "true", "version": "19.0.1.3", "stub": 1, "live_relays": 0, "live_crons": 0, "extras": {}}
+    row.update(overrides)
+    return "echo '" + json.dumps(row) + "'"
+
+
+def test_neutralization_of_reads_each_db_in_one_round_trip(tmp_path, monkeypatch):
+    """Every classification path, through one shell loop and one `host.run`.
+    A db psql cannot read (exit != 0) is left out of the map entirely:
+    unknown, which the UI shows as no status rather than as a guess."""
+    calls = _fake_psql(
+        tmp_path,
+        monkeypatch,
+        {
+            "staging": _signals(),
+            # the whole point of the extra signals: the flag says safe, a
+            # cron switched back on says otherwise
+            "reheated": _signals(live_crons=7),
+            # `base` is clean, but a payment provider can still charge a card
+            "billable": _signals(extras={"payment_provider": 1}),
+            "claimed": _signals(stub=0),  # flag without the stub -- written by hand
+            "halfway": _signals(flag=None),  # the script ran but the flag never landed
+            "prod": _signals(flag=None, stub=0, live_relays=2, live_crons=20),
+            # 14/15 neutralize without a stub (odoo.sh's own, no
+            # neutralize.sql upstream yet) -- demanding one there would paint
+            # every correctly neutralized old staging yellow
+            "ancient": _signals(stub=0, version="14.0.1.3"),
+            "unversioned": _signals(stub=0, version=None),  # unreadable version costs a yellow, never a green
+            "broken": "exit 1",  # no such table / postgres down
+        },
+    )
+
+    states = {db: report["state"] for db, report in probes.neutralization_of(list("x"), "5432", Host()).items()}
+    assert states == {}  # the stub answers nothing for an unknown name
+    assert len(calls) == 1
+
+    dbs = ["staging", "reheated", "billable", "claimed", "halfway", "prod", "ancient", "unversioned", "broken"]
+    reports = probes.neutralization_of(dbs, "5432", Host())
+
+    assert {db: report["state"] for db, report in reports.items()} == {
+        "staging": probes.NEUTRALIZED,
+        "reheated": probes.PARTIAL,
+        "billable": probes.PARTIAL,
+        "claimed": probes.PARTIAL,
+        "halfway": probes.PARTIAL,
+        "prod": probes.NOT_NEUTRALIZED,
+        "ancient": probes.NEUTRALIZED,
+        "unversioned": probes.PARTIAL,
+    }
+    # the signals ride along, so a PARTIAL can say which surface is live
+    assert reports["billable"]["extras"] == {"payment_provider": 1}
+    assert len(calls) == 2
+
+    assert probes.neutralization_of([], "5432", Host()) == {}  # no dbs, no call
+    assert len(calls) == 2
+
+
+def test_a_mail_catcher_is_not_counted_as_a_live_relay():
+    """A dev stack's catcher accepts mail and never relays it -- `panes/mail.py`
+    already says so, via odoo-db's `is_test_catcher`. Counting one as a live
+    relay would paint every neutralized dev database yellow forever, and would
+    have the two halves of the app contradicting each other."""
+    for host in ("invalid", "mailhog", "mailpit", "maildev"):
+        assert f"'{host}'" in probes._DEAD_END_HOSTS
+
+    # and they are excluded where it counts, not just listed
+    assert f"NOT IN ({probes._DEAD_END_HOSTS})" in probes._NEUTRALIZATION_SQL
+    # a NULL host is no relay at all, and NOT IN would swallow the whole row
+    assert "coalesce(smtp_host, '')" in probes._NEUTRALIZATION_SQL
+
+
+def test_the_pre_16_payment_table_is_still_checked():
+    """`payment_acquirer` became `payment_provider` in 16. Both stay listed:
+    the existence guard cannot tell a missing table from a misspelled one, so
+    dropping the old name would silently retire the highest-value check on
+    every 14/15 database rather than failing loudly."""
+    tables = [table for table, _ in probes._EXTRA_SURFACES]
+    assert "payment_acquirer" in tables
+    assert "payment_provider" in tables
+
+
+def test_extra_surface_checks_are_guarded_by_table_existence():
+    """The eight module surfaces name tables most databases don't have, and
+    naming a missing table fails the whole statement at parse time -- which
+    would lose the answer for every db without, say, `whatsapp_account`.
+    They must go through `query_to_xml` (SQL as a string, parsed only when
+    run) behind a `to_regclass` CASE, never straight into the FROM clause.
+    """
+    sql = probes._NEUTRALIZATION_SQL
+
+    for table, _condition in probes._EXTRA_SURFACES:
+        assert f"FROM {table}" not in sql, f"{table} named directly -- one missing table loses every signal"
+        assert f"('{table}'," in sql  # carried as data, for the guarded lookup
+
+    assert "to_regclass" in sql
+    assert "query_to_xml" in sql
+
+    # and the guard has to report back: a surface missing from `checked` on
+    # every database is a table that was never found, which is exactly what a
+    # typo looks like -- indistinguishable from "module not installed"
+    # without this list.
+    assert "'checked'" in sql

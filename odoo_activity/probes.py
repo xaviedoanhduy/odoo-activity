@@ -15,6 +15,7 @@ import os
 import platform
 import re
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -1587,6 +1588,190 @@ def databases_by_role(role: str, port: str | PgTarget | None = None, host: Host 
     out = host.run(cmd, input_text=_DB_BY_ROLE_SQL).stdout
 
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+# The eight surfaces beyond `base` that a neutralized database must not
+# still have live, each condition copied from that module's own
+# `data/neutralize.sql` (Odoo 19; the statements have been stable since
+# 16). `(table, what neutralize.sql leaves behind, why it matters)`:
+#
+# Only tables whose owning module also owns the column in the condition, so
+# "the table is here" implies "the column is here". That deliberately
+# leaves out the checks that hang off `res_company`/`res_users`
+# (sms_twilio, microsoft_calendar, the l10n_* EDI credentials): those
+# tables exist on every database while their columns come and go with the
+# module, which no static SQL can guard against.
+# Hosts that accept mail and never relay it: Odoo's own neutralization
+# stub, plus the catchers a dev stack normally runs (doodba ships one).
+# Counting a catcher as a live relay would paint every neutralized dev
+# database yellow forever -- and `panes/mail.py` already treats them as
+# safe, via odoo-db's `is_test_catcher`, so counting them here would have
+# the two halves of the app contradicting each other.
+_DEAD_END_HOSTS = "'invalid', 'mailhog', 'mailpit', 'maildev'"
+
+_STUB_IDS = f"SELECT id FROM ir_mail_server WHERE smtp_host IN ({_DEAD_END_HOSTS})"  # noqa: S608 -- _DEAD_END_HOSTS is a literal above; nothing external reaches it
+
+_EXTRA_SURFACES = (
+    # payment/data/neutralize.sql -- a provider still able to move real money
+    ("payment_provider", "state NOT IN ('test', 'disabled')"),
+    # the same table before Odoo 16 renamed it. Both are listed because a
+    # missing table and a misspelled one look identical to the guard below:
+    # dropping the old name would silently retire the highest-value check on
+    # every 14/15 database instead of failing loudly.
+    ("payment_acquirer", "state NOT IN ('test', 'disabled')"),
+    # iap/data/neutralize.sql -- credits that bill the customer (SMS, OCR, snailmail)
+    ("iap_account", "account_token NOT LIKE '%+disabled'"),
+    # mail/data/neutralize.sql -- still fetching and processing real incoming mail
+    ("fetchmail_server", "active"),
+    # mail/data/neutralize.sql -- a template pinned to a named relay. The
+    # stub is excluded: a template pointing at Odoo's own dead-end relay is
+    # exactly as harmless as one pointing nowhere.
+    ("mail_template", f"mail_server_id IS NOT NULL AND mail_server_id NOT IN ({_STUB_IDS})"),
+    # whatsapp/data/neutralize.sql -- real API credentials, outbound messages
+    ("whatsapp_account", "token <> 'dummy_token'"),
+    # voip/data/neutralize.sql -- a real telephony provider, not the demo one
+    ("voip_provider", "mode <> 'demo'"),
+    # account_online_synchronization/data/neutralize.sql -- live bank feed
+    ("account_online_link", "client_id <> 'duplicate'"),
+    # certificate/data/neutralize.sql -- real signing certificates
+    ("certificate_certificate", "pkcs12_password <> 'dummy'"),
+)
+
+# Each surface as a row of (table, condition), for the guarded probe below.
+_EXTRA_VALUES = ",\n        ".join(
+    f"('{table}', '{condition.replace(chr(39), chr(39) * 2)}')" for table, condition in _EXTRA_SURFACES
+)
+
+# Neutralization, as evidence rather than the one flag: the flag is what the
+# database *claims* (`database.is_neutralized`, written by
+# base/data/neutralize.sql), everything else is what it can still *do*. A
+# flag inserted by hand -- or a cron switched back on afterwards -- makes a
+# live database read as safe, which is the one mistake this whole status
+# exists to prevent.
+#
+# `version` is base's own `latest_version`, because the stub relay only
+# exists from Odoo 16 (`odoo/cli/neutralize.py` and the `neutralize.sql`
+# files arrive together there). On 14/15 the flag is set by whatever copied
+# the database -- odoo.sh's platform, an in-house script -- with no stub to
+# find, and `base/models/ir_cron.py` already reads the flag back then.
+# Demanding a stub there would paint every correctly neutralized old
+# staging yellow forever.
+#
+# The `base` signals are queried directly: those tables exist on every
+# version 14->19. The module surfaces cannot be, since naming a table that
+# isn't there fails the whole statement at parse time and would lose the
+# answer entirely instead of narrowing it. They go through `query_to_xml`,
+# which takes its SQL as a *string* -- so it is only ever parsed when
+# `to_regclass` has already confirmed the table exists, and the CASE keeps
+# it unevaluated otherwise. `extras` lists only what is still live (a clean
+# database answers `{}`), while `checked` lists every surface that was
+# actually evaluated -- without it, a misspelled table name and a module
+# that isn't installed are indistinguishable, and a typo would retire a
+# check permanently with nothing to show for it.
+_NEUTRALIZATION_SQL = f"""SELECT json_build_object(
+  'flag', (SELECT value FROM ir_config_parameter WHERE key = 'database.is_neutralized'),
+  'version', (SELECT latest_version FROM ir_module_module WHERE name = 'base'),
+  'stub', (SELECT count(*) FROM ir_mail_server WHERE smtp_host = 'invalid' AND name LIKE 'neutralization%'),
+  'live_relays', (SELECT count(*) FROM ir_mail_server
+                   WHERE active AND coalesce(smtp_host, '') NOT IN ({_DEAD_END_HOSTS})),
+  'live_crons', (SELECT count(*) FROM ir_cron c WHERE c.active AND c.id NOT IN (
+      SELECT res_id FROM ir_model_data WHERE model = 'ir.cron' AND name = 'autovacuum_job' AND module = 'base')),
+  'checked', (SELECT coalesce(json_agg(tbl ORDER BY tbl), '[]'::json)
+                FROM (VALUES
+                  {_EXTRA_VALUES}
+                ) AS s(tbl, cond) WHERE to_regclass(s.tbl) IS NOT NULL),
+  'extras', (
+    SELECT coalesce(json_object_agg(name, n), '{{}}'::json) FROM (
+      SELECT s.tbl AS name, (xpath('/row/c/text()', CASE WHEN to_regclass(s.tbl) IS NOT NULL THEN
+               query_to_xml('SELECT count(*) AS c FROM ' || s.tbl || ' WHERE ' || s.cond, false, true, '')
+             END))[1]::text::bigint AS n
+      FROM (VALUES
+        {_EXTRA_VALUES}
+      ) AS s(tbl, cond)
+    ) live WHERE n > 0
+  )
+)"""  # noqa: S608 -- interpolates _EXTRA_SURFACES, a literal in this file; nothing external reaches it
+
+_TRUE = {"true", "t", "1", "yes", "y", "on"}
+
+# The three answers a database gets. PARTIAL is the one that pays for the
+# extra signals: it means the two disagree -- treat the db as live until
+# someone looks.
+NEUTRALIZED = "neutralized"
+PARTIAL = "partial"
+NOT_NEUTRALIZED = "not_neutralized"
+
+
+def _major_version(version: str | None) -> int:
+    """Base's major version off `latest_version` (`16.0.1.3` -> 16), or 0
+    when the database didn't say."""
+    head = (version or "").split(".")[0]
+    return int(head) if head.isdigit() else 0
+
+
+def _neutralization_state(row: Mapping) -> str:
+    """Classify one database's signals.
+
+    The flag alone is never enough in either direction: claimed-and-clean is
+    the only way to NEUTRALIZED, and evidence of the script having run (the
+    stub relay) keeps a database off NOT_NEUTRALIZED even with the flag
+    missing -- a neutralization that died halfway is not a production
+    database, but it is not a safe one either.
+
+    The stub is only *required* from Odoo 16, where it starts existing (see
+    `_NEUTRALIZATION_SQL`). An unreadable version is treated as modern:
+    that way the uncertainty costs a yellow, never a false green.
+    """
+    claimed = str(row.get("flag") or "").strip().lower() in _TRUE
+    live = row.get("live_relays") or row.get("live_crons") or row.get("extras")
+
+    stub = bool(row.get("stub"))
+    stub_expected = _major_version(row.get("version")) >= 16 or not row.get("version")
+
+    if claimed and not live and (stub or not stub_expected):
+        return NEUTRALIZED
+    if claimed or stub:
+        return PARTIAL
+    return NOT_NEUTRALIZED
+
+
+def neutralization_of(dbs: list[str], port: str | PgTarget | None = None, host: Host = LOCAL) -> dict[str, dict]:
+    """{db: report} -- one report per database that answered.
+
+    The report is the raw signals plus the `state` read off them
+    (NEUTRALIZED / PARTIAL / NOT_NEUTRALIZED). Callers that only paint a tag
+    take `state`; the rest is what makes a PARTIAL actionable -- `extras`
+    names the surface that is still live, `checked` names the surfaces that
+    were evaluated at all -- and it is already in hand, so throwing it away
+    would only mean fetching it again later.
+
+    Neutralization is per-database state (rows in each db's own tables), so
+    it takes a connection per db -- but they go out as one shell loop, one
+    round trip for the whole list, since this runs on every instance
+    highlight and remotely each round trip is an ssh hop.
+
+    A db missing from the result is one psql could not read (postgres down,
+    no such table -- not an odoo database): unknown, which the callers show
+    as no status rather than as a guess in either direction.
+    """
+    if not dbs:
+        return {}
+
+    psql = shlex.join(PgTarget.of(port).psql("-tAc", _NEUTRALIZATION_SQL, "-d"))
+    # `&&` so a failed connection prints nothing at all and stays unknown
+    loop = f'for db in {shlex.join(dbs)}; do v=$({psql} "$db" 2>/dev/null) && printf \'%s\\t%s\\n\' "$db" "$v"; done'
+    out = host.run(["sh", "-c", loop]).stdout
+
+    reports = {}
+    for line in out.splitlines():
+        db, _, payload = line.partition("\t")
+        try:
+            row = json.loads(payload)
+            reports[db] = {**row, "state": _neutralization_state(row)}
+        except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
+            continue  # unparseable is unknown, same as unreachable
+
+    return reports
 
 
 _LONG_QUERIES_SQL = (

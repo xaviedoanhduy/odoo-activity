@@ -337,6 +337,38 @@ in database mode).
   by that role. A container's config names its own role, address and
   password instead, and `ODOO_ACTIVITY_DB_ROLE` (a convention of *this*
   box's cluster) deliberately doesn't apply to it.
+  Each db row then carries its neutralization status, from four signals in
+  one query: the `database.is_neutralized` flag the db claims, plus whether
+  Odoo's stub mail relay is in place and whether any real mail server or
+  cron is still active. The stub is only expected from Odoo 16, where
+  `neutralize.sql` first ships — on 14/15 the flag is set by whatever copied
+  the database, with no stub to find. Green `NEUTRALIZED` is claimed *and*
+  confirmed —
+  nothing on it reaches the outside. Red `NOT NEUTRALIZED` is a live
+  database, treat every action as production. Yellow `PARTIALLY
+  NEUTRALIZED` is the case the extra signals pay for: the flag says safe
+  but something can still fire (a flag written by hand, a neutralization
+  that died halfway, a cron switched back on afterwards) — treat as live
+  until someone looks. On top of the `base` tables it checks eight module
+  surfaces a neutralized database must not still have live — payment
+  providers, IAP credits, fetchmail, mail templates pinned to a relay,
+  WhatsApp, VoIP, bank feeds, signing certificates — each condition copied
+  from that module's own `data/neutralize.sql`. Those tables are absent on
+  most databases and naming a missing one would fail the whole statement, so
+  they go through `query_to_xml` behind a `to_regclass` guard; the checks
+  that hang off `res_company`/`res_users` (sms_twilio, microsoft_calendar,
+  `l10n_*` EDI credentials) are deliberately left out, since those tables
+  exist everywhere while their columns come and go with the module. A mail
+  catcher (mailhog, mailpit, maildev) is not counted as a live relay: it
+  accepts mail and never relays it, which is what the Mail tab already says
+  about it. The report also carries `checked`, the surfaces actually
+  evaluated — without it a misspelled table name and a module that isn't
+  installed look identical, and a typo would retire a check silently.
+  It costs one extra round trip for the whole list (a psql
+  connection per db, sent as one shell loop), and a db postgres couldn't
+  answer for carries no tag at all rather than a guess. The MCP
+  `instance_databases` tool returns the whole report — state plus the raw
+  signals — as a `neutralized` map.
 - **Top** — the manager gives the instance's master pid (`systemctl ...
   -p MainPID` / `supervisorctl pid`); `ps -eo pid,ppid,user,%mem,args` is then
   walked down the ppid tree from there to find every worker.

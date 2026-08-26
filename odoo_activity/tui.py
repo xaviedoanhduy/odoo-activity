@@ -24,6 +24,9 @@ from odoo_activity.host import Host, to_thread
 from odoo_activity.panes.confirm import ConfirmScreen
 from odoo_activity.panes.detail import ActivityPane
 from odoo_activity.probes import (
+    NEUTRALIZED,
+    NOT_NEUTRALIZED,
+    PARTIAL,
     Instance,
     container_host,
     databases_of,
@@ -34,6 +37,8 @@ from odoo_activity.probes import (
     instance_workdir,
     list_instances,
     match_odooly_env,
+    neutralization_of,
+    pg_target_of,
     read_cpu_times,
     read_host_stats,
     read_odooly_envs,
@@ -105,6 +110,26 @@ def _odooly_marker(env: str | None) -> str:
     an absent marker reads as the flag not being passed, which is the one
     thing the tag exists to tell apart."""
     return "[green]ODOOLY[/]" if env else "[red]ODOOLY[/]"
+
+
+# green: the database says it is neutralized and nothing on it can still
+# reach the outside. yellow: those two disagree — a hand-written flag, or a
+# cron switched back on after the fact. red: a live database.
+_NEUTRALIZATION_TAGS = {
+    NEUTRALIZED: "  [green]NEUTRALIZED[/]",
+    PARTIAL: "  [yellow]PARTIALLY NEUTRALIZED[/]",
+    NOT_NEUTRALIZED: "  [red]NOT NEUTRALIZED[/]",
+}
+
+
+def _neutralized_marker(state: str | None) -> str:
+    """The neutralization tag on a db row.
+
+    Empty while it is still unknown — the fetch hasn't landed, or psql
+    couldn't read that db — since guessing either way is the one thing this
+    tag exists to prevent.
+    """
+    return _NEUTRALIZATION_TAGS.get(state or "", "")
 
 
 def _bar(pct: float, width: int = 24, red_at: float = 80, yellow_at: float = 50) -> str:
@@ -259,6 +284,7 @@ class OdooActivity(App):
         self._row_owner: dict[str, str] = {}  # row key -> owning instance key
         self._row_db: dict[str, str] = {}  # db row key -> db name
         self._db_cache: dict[str, tuple[list[str], str | None]] = {}  # instance key -> its (dbs, port)
+        self._neutralized: dict[str, dict[str, dict]] = {}  # instance key -> {db: neutralization report}
         self._shown_key: str | None = None  # highlighted row driving the activity pane
         self._instances_ready = False  # first _rebuild_instances has finished mounting rows
 
@@ -422,7 +448,8 @@ class OdooActivity(App):
             # between their uptime and their status: the tag reads as that
             # same column rather than as a ragged suffix of the db name
             marker = f"  {_odooly_marker(self.odooly_env_for(instance_name, db))}" if self.enable_odooly else ""
-            label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}{marker}"
+            neutral = _neutralized_marker(self._neutralized.get(key, {}).get(db, {}).get("state"))
+            label = f"  [dim]└──[/] {_db_label(db, port, name_width, uptime_width, indent=4)}{neutral}{marker}"
             items.append(ListItem(Label(label), name=db_key))
 
         return items
@@ -471,8 +498,25 @@ class OdooActivity(App):
         if inst is None:
             return
 
-        self._db_cache[key] = await to_thread(databases_of, inst, self.host)
+        self._db_cache[key], self._neutralized[key] = await to_thread(self._fetch_databases, inst)
         await self._mount_databases(key)
+
+    def _fetch_databases(self, inst: Instance) -> tuple[tuple[list[str], str | None], dict[str, dict]]:
+        """The instance's dbs and their neutralization, in one thread hop.
+
+        Both in a single `to_thread`, deliberately: each await in the worker
+        is a point where an arrow keypress starts the next (exclusive) fetch
+        and cancels this one — mid-way, after the cache was filled but
+        before the rows were mounted, which leaves an instance showing no
+        databases at all.
+
+        `pg_target_of` rather than the port `databases_of` returns: a docker
+        instance's postgres also needs its container address and credentials
+        to be reachable.
+        """
+        dbs = databases_of(inst, self.host)
+        neutralized = neutralization_of(dbs[0], pg_target_of(inst, self.host), self.host) if dbs[0] else {}
+        return dbs, neutralized
 
     async def _mount_databases(self, key: str) -> None:
         """Replace `key`'s db rows in place with what `_db_cache` now holds."""
@@ -593,9 +637,10 @@ class OdooActivity(App):
             if names or inst is None or inst["manager"] != "docker" or inst["status"] != "running":
                 continue
 
-            fetched = await to_thread(databases_of, inst, self.host)
+            fetched, neutralized = await to_thread(self._fetch_databases, inst)
             if fetched[0]:
                 self._db_cache[key] = fetched
+                self._neutralized[key] = neutralized
                 await self._mount_databases(key)
 
     def current_instance(self) -> Instance | None:
